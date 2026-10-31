@@ -1,0 +1,96 @@
+Revision history for Markdown-Simple
+
+0.23    2026-10-05
+        - Fixed the Windows build. Simple.xs moved to the top of the dist
+          and remove XSMULTI
+
+0.22    2026-08-14
+        - Fixed a build failure on compilers older than GCC 4.3
+        - The SSE2 backend is no longer selected on x86_64 CPUs without
+          SSSE3. It shuffles with pshufb, which is SSSE3, but the
+          dispatcher tested only the SSE2 bit, so on a pre-SSSE3 x86_64
+          (K8, Prescott) the first classified chunk was an illegal
+          instruction. Those CPUs now get the scalar backend, which is
+          what the code always claimed happened.
+        - AVX2 selection now also requires OSXSAVE, an XCR0 that says
+          the YMM state is saved across a context switch, and the BMI2
+          the backend's target attribute lets the compiler emit. An
+          AVX2-capable CPU under a kernel that never enabled XSAVE was
+          running vector code with a silently truncated register.
+        - No more "'hot' attribute directive ignored" warnings on GCC
+          4.2, which predates both attributes.
+
+0.21    2026-08-12
+        - Fix _abi_ptr on platforms that map the shared object at a high
+          address.
+        - Fix loading on perl 5.10.0: the ABI selftest used mPUSHs, which
+          only arrived after 5.10.0, so the .so failed to load there with
+          "undefined symbol: mPUSHs". Add an #ifndef shim; every use was
+          already EXTEND-guarded, so the expansion is exact.
+
+0.20    2026-08-07
+        - Add heading_ids => 1: headings get a GitHub-style anchor, as
+          <h2 id="the-slug">. 
+        - Add render_with_toc, returning ($html, \@headings) where each
+          heading is { level, text, id } in document order, carrying the
+          ids actually emitted so a table of contents can link straight
+          into the document. Implies heading_ids for that render.
+        - Add mds_render_html_to_sv_toc as the widest C entry point; the
+          two existing ones are now wrappers passing NULL.
+        - Add a shared C ABI, include/mds_abi.h
+        - Add mds_buf_insert, and src/mds_slug.h.
+        - Add t/53-heading-ids.t, t/54-toc.t, t/55-abi.t.
+
+0.19    2026-08-07
+        - Fix a memory leak on every render.
+        - Fix a second leak in the block scanner.
+        - Add t/56-render-leak.t
+
+0.17    2026-07-12
+        - Add highlight => 1 render option: fenced code blocks with a
+          language tag are syntax-highlighted via Eshu's eshu_hl.h pass,
+          wrapping tokens in <span class="esh-*"> elements.
+
+0.16    2026-07-03
+        - No changes recorded.
+
+0.15    2026-06-22
+        - Fix "unsupported TLS program header" load failure on OpenBSD.
+        - Fix more C89 build failures 
+        - Fix LTO probe to detect old-clang.
+
+0.14    2026-06-05
+        - Fix C89 issues
+
+0.13    2026-05-30
+        - Fix build failure on perls built without MULTIPLICITY /
+          PERL_IMPLICIT_CONTEXT 
+        - Fix "redefinition of 's_scalar'"
+
+0.12    2026-05-27
+        - SIMD acceleration: SSE2/SSSE3 on x86_64, AVX2 on capable hosts,
+          NEON on aarch64, with scalar fallback dispatched at runtime via
+          CPUID / hwcap. Refactored Makefile.PL to probe headers with
+          Devel::CheckLib before enabling each backend.
+
+0.11    2025-06-22
+        - Adds a strip_markdown function
+
+0.10    2025-06-21
+        - prompt engineer the fix to allow bold text to come the line after
+          lists while using '*'
+
+0.09    2025-06-21
+        - prompt engineer support for _ and __ for italic and bold.
+
+0.08    2025-06-21
+        - prompt engineer support for nested components in lists and tables.
+
+0.07    2025-06-20
+        - prompt engineer utf8 support - it's a bit of a hack!
+
+0.06    2025-06-19
+        - Adds preprocessing by default which replaces \r\n with \n
+
+0.01    2025-06-18
+        First version, released on an unsuspecting world.

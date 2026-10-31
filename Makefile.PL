@@ -1,0 +1,246 @@
+use 5.006;
+use strict;
+use warnings;
+use Config;
+use File::Temp ();
+use ExtUtils::MakeMaker;
+use ExtUtils::Depends;
+use Devel::CheckLib;
+
+sub _probe {
+    my ($label, $cflags, $header, $body) = @_;
+    my $ok = check_lib(
+        header   => $header,        # e.g. 'emmintrin.h'
+        function => $body,          # body of int main(void) { ... }
+        ccflags  => $cflags,        # e.g. '-msse2'
+        # debug => 1,               # uncomment to see compiler output
+    );
+    print "probe: $label ... ", ($ok ? "yes\n" : "no\n");
+    return $ok ? 1 : 0;
+}
+
+# Free-form compile probe: writes $src to a temp .c, runs $Config{cc}
+# with $cflags, returns true iff the object compiled cleanly.
+# Used for the SIMD probes because they need to declare a top-level
+# static function with __attribute__((target(...))), which check_lib's
+# "body wedged into main" template can't express.
+sub _probe_compile {
+    my ($label, $cflags, $src) = @_;
+    my ($fh, $cfile) = File::Temp::tempfile(SUFFIX => '.c', UNLINK => 1);
+    print $fh $src;
+    close $fh;
+    my $ofile = "${cfile}.o";
+    my $cc    = $Config{cc} || 'cc';
+    my $ccfl  = $Config{ccflags} || '';
+    my $cmd   = "$cc $ccfl $cflags -c $cfile -o $ofile";
+    # Silence both streams; we only care about the exit code.
+    my $redir = ($^O eq 'MSWin32') ? '>NUL 2>&1' : '>/dev/null 2>&1';
+    my $rc    = system("$cmd $redir");
+    unlink $ofile if -e $ofile;
+    my $ok = ($rc == 0);
+    print "probe: $label ... ", ($ok ? "yes\n" : "no\n");
+    return $ok ? 1 : 0;
+}
+
+# LTO probe: compile a trivial .c with $cflags (which includes -flto) and
+# then link it as a shared object using $Config{lddlflags} *without* the
+# extra cflags. This mirrors exactly what MakeMaker does: OPTIMIZE goes
+# to the compile step, lddlflags goes to the link step. Old clang (≤ 3.6)
+# emits LLVM bitcode into the .o under -flto, which the system BFD ld
+# then refuses with "file not recognized: File format not recognized".
+# A check_lib-style probe (compile+link with same flags) would miss this
+# entirely because the link step would also get -flto and clang would
+# drive the LTO link path.
+sub _probe_lto_link {
+    my ($cflags) = @_;
+    my ($fh, $cfile) = File::Temp::tempfile(SUFFIX => '.c', UNLINK => 1);
+    print $fh "int mds_lto_probe(void) { return 0; }\n";
+    close $fh;
+    my $ofile  = "${cfile}.o";
+    my $sofile = "${cfile}." . ($Config{dlext} || 'so');
+    my $cc     = $Config{cc} || 'cc';
+    my $ccfl   = $Config{ccflags}  || '';
+    my $lddl   = $Config{lddlflags} || '-shared';
+    my $redir  = ($^O eq 'MSWin32') ? '>NUL 2>&1' : '>/dev/null 2>&1';
+    my $rc_c   = system("$cc $ccfl $cflags -c $cfile -o $ofile $redir");
+    my $ok     = 0;
+    if ($rc_c == 0 && -s $ofile) {
+        my $rc_l = system("$cc $lddl $ofile -o $sofile $redir");
+        $ok = ($rc_l == 0 && -s $sofile);
+    }
+    unlink $ofile  if -e $ofile;
+    unlink $sofile if -e $sofile;
+    print "probe: LTO (compile -flto, link plain) ... ",
+          ($ok ? "yes\n" : "no\n");
+    return $ok ? 1 : 0;
+}
+
+my @SIMD_DEFINES;
+my $arch = "$Config{archname} $Config{myarchname} $Config{archname64}";
+
+# IMPORTANT: the SIMD probes must compile under the *exact* flags the
+# unity build will use — i.e. WITHOUT -msse2/-mavx2 baseline — because
+# src/simd/mds_simd_{sse2,avx2}.c rely on per-function
+# __attribute__((target("..."))) for ISA escalation. If a probe with
+# -mavx2 succeeds but the compiler does not honour the target attribute
+# (old GCC, MSVC, etc.), the build will still fail. Probing through the
+# attribute matches the build's actual code path and degrades cleanly
+# to scalar on hosts where the attribute is unavailable.
+if ($arch =~ /(?:x86_64|amd64|i[3-6]86)/i) {
+    push @SIMD_DEFINES, '-DMDS_HAVE_SSE2' if _probe_compile(
+        'SSE2/SSSE3 (per-function target attribute)', '',
+        <<'C_SSE2');
+#include <tmmintrin.h>
+#include <emmintrin.h>
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("ssse3")))
+#endif
+static int probe_ssse3(void) {
+    __m128i z = _mm_setzero_si128();
+    __m128i v = _mm_shuffle_epi8(z, z);
+    (void)v;
+    return 0;
+}
+int main(void) { return probe_ssse3(); }
+C_SSE2
+
+    push @SIMD_DEFINES, '-DMDS_HAVE_AVX2' if _probe_compile(
+        'AVX2 (per-function target attribute)', '',
+        <<'C_AVX2');
+#include <immintrin.h>
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,bmi2")))
+#endif
+static int probe_avx2(void) {
+    __m256i v = _mm256_setzero_si256();
+    (void)v;
+    return 0;
+}
+int main(void) { return probe_avx2(); }
+C_AVX2
+}
+elsif ($arch =~ /(?:aarch64|arm64)/i) {
+    push @SIMD_DEFINES, '-DMDS_HAVE_NEON'
+        if _probe('NEON', '', 'arm_neon.h',
+                  'uint8x16_t v=vdupq_n_u8(0);(void)v;return 0;');
+}
+
+my $SIMD_DEFINE = join ' ', @SIMD_DEFINES;
+print "SIMD defines: ", ($SIMD_DEFINE || '(none)'), "\n";
+
+{
+    my $hdr = "src/simd/mds_simd_config.h";
+    open my $fh, '>', $hdr or die "open $hdr: $!";
+    print $fh "/* generated by Makefile.PL — do not edit */\n";
+    print $fh "#ifndef MDS_SIMD_CONFIG_H\n#define MDS_SIMD_CONFIG_H\n";
+    for my $d (@SIMD_DEFINES) {
+        (my $sym = $d) =~ s/^-D//;
+        print $fh "#define $sym 1\n";
+    }
+    print $fh "#endif\n";
+    close $fh;
+    print "wrote $hdr\n";
+}
+
+my $OPTIMIZE_FLAGS;
+if (defined $ENV{MDS_OPTIMIZE}) {
+    $OPTIMIZE_FLAGS = $ENV{MDS_OPTIMIZE};
+}
+elsif ($ENV{MDS_DEBUG}) {
+    $OPTIMIZE_FLAGS = '-O0 -g';
+}
+else {
+    my $base = '-O3';
+    # LTO probe — must mimic the *actual* MakeMaker two-step pipeline:
+    # compile with -flto via OPTIMIZE, then link with $Config{lddlflags}
+    # which does NOT carry -flto. Old clang (≤ 3.6) plus default system
+    # ld is the failure mode: clang emits LLVM bitcode into the .o, then
+    # BFD ld chokes with "file not recognized: File format not recognized".
+    # check_lib() would miss this because it compiles+links with the same
+    # flags, so the link sees -flto and clang drives the LTO link path.
+    # We have to split the steps to catch the asymmetry. See CPAN Testers
+    # c90d6af4 / ccf4b794 / 56908ee0 (FreeBSD 10 + clang 3.4).
+    my $lto_ok = _probe_lto_link("$base -flto");
+    $OPTIMIZE_FLAGS = $lto_ok ? "$base -flto" : $base;
+}
+print "OPTIMIZE: $OPTIMIZE_FLAGS\n";
+
+my $EXTRA_LDDLFLAGS = defined $ENV{MDS_PGO_LDFLAGS} ? $ENV{MDS_PGO_LDFLAGS} : '';
+print "LDDLFLAGS extras: $EXTRA_LDDLFLAGS\n" if length $EXTRA_LDDLFLAGS;
+
+# Simple.xs lives at the top of the dist, not under lib/, and the build is the
+# plain single-extension one MakeMaker defaults to. An XSMULTI build from
+# lib/Markdown/Simple.xs writes its linker export list to
+# lib/Markdown/Simple.def, while the import-library rule Strawberry adds for
+# MinGW reads $(EXPORT_LIST), which is always $(BASEEXT).def in the top
+# directory - the two names never met and dlltool failed the build after a
+# clean compile and link (CPAN Testers, 5.42 Strawberry).
+my $pkg = ExtUtils::Depends->new('Markdown::Simple', 'Eshu');
+$pkg->set_inc('-Isrc -Iinclude');
+# The runtime C ABI consumers resolve through Markdown::Simple::_abi_ptr.
+# Only the interface header is installed; mds_abi_impl.h and everything under
+# src/ stay private to this build.
+$pkg->install('include/mds_abi.h');
+mkdir 'Install' unless -d 'Install';
+$pkg->save_config('Install/Files.pm');
+my %dep_vars = $pkg->get_makefile_vars;
+delete $dep_vars{LDFROM};  # empty, and would clobber MakeMaker's default
+$dep_vars{PM}{'lib/Markdown/Simple.pm'} = '$(INST_LIB)/Markdown/Simple.pm';
+
+my %WriteMakefileArgs = (
+    OPTIMIZE         => $OPTIMIZE_FLAGS,
+    ($EXTRA_LDDLFLAGS ne '' ? (LDDLFLAGS => "$Config{lddlflags} $EXTRA_LDDLFLAGS") : ()),
+    NAME             => 'Markdown::Simple',
+    AUTHOR           => q{LNATION <email@lnation.org>},
+    VERSION_FROM     => 'lib/Markdown/Simple.pm',
+    ABSTRACT_FROM    => 'lib/Markdown/Simple.pm',
+    LICENSE          => 'artistic_2',
+    MIN_PERL_VERSION => '5.006',
+    macro => { TARFLAGS   => "--format=ustar -c -v -f" },
+    CONFIGURE_REQUIRES => {
+        'ExtUtils::MakeMaker' => '0',
+        'Devel::CheckLib'     => '0',
+        'ExtUtils::Depends'   => '0.404',
+        'Eshu'                => '0.10',
+    },
+    TEST_REQUIRES => {
+        'Test::More' => '0',
+    },
+    PREREQ_PM => {
+	'Eshu'		      => '0.10' 
+    },
+    dist  => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
+    clean => { FILES => 'Markdown-Simple-* Simple.c Simple.bs Install/Files.pm' },
+    # The engine is a unity build: Simple.xs #includes every src/*.c, so the
+    # only compilation unit MakeMaker knows about is Simple.xs itself and it
+    # never rescans those includes. Without this an edit to src/ leaves the
+    # old object in place and `make` reports success having rebuilt nothing.
+    depend => {
+        'Simple$(OBJ_EXT)' => join(' ',
+            sort(glob('src/*.c'), glob('src/*.h'),
+                 glob('src/simd/*.c'), glob('src/simd/*.h'),
+                 glob('include/*.h'))),
+    },
+    %dep_vars,
+);
+
+# Compatibility with old versions of ExtUtils::MakeMaker
+unless (eval { ExtUtils::MakeMaker->VERSION('6.64'); 1 }) {
+    my $test_requires = delete $WriteMakefileArgs{TEST_REQUIRES} || {};
+    @{$WriteMakefileArgs{PREREQ_PM}}{keys %$test_requires} = values %$test_requires;
+}
+
+unless (eval { ExtUtils::MakeMaker->VERSION('6.55_03'); 1 }) {
+    my $build_requires = delete $WriteMakefileArgs{BUILD_REQUIRES} || {};
+    @{$WriteMakefileArgs{PREREQ_PM}}{keys %$build_requires} = values %$build_requires;
+}
+
+delete $WriteMakefileArgs{CONFIGURE_REQUIRES}
+    unless eval { ExtUtils::MakeMaker->VERSION('6.52'); 1 };
+delete $WriteMakefileArgs{MIN_PERL_VERSION}
+    unless eval { ExtUtils::MakeMaker->VERSION('6.48'); 1 };
+delete $WriteMakefileArgs{LICENSE}
+    unless eval { ExtUtils::MakeMaker->VERSION('6.31'); 1 };
+
+WriteMakefile(%WriteMakefileArgs);
+
